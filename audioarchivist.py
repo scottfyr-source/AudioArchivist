@@ -3,6 +3,7 @@ import os
 import platform
 import re
 import threading
+import time
 import traceback
 import wave
 import json
@@ -256,6 +257,60 @@ def eject_cd_drive(drive_letter):
         return True
     except Exception as exc:
         return False
+
+
+def _play_alias(drive_letter):
+    return f"cd_play_{drive_letter}"
+
+
+def start_cd_playback(drive_letter, start_frame, end_frame):
+    """
+    Begin playing CD audio directly from the drive using MCI.
+    Returns immediately once playback has started; no temp file ripping.
+    """
+    alias = _play_alias(drive_letter)
+    # Release any stale alias from a previous play that didn't get cleaned up.
+    try:
+        mci_send_string(f"close {alias}")
+    except RuntimeError:
+        pass
+    open_cd_drive(drive_letter, alias=alias)
+    try:
+        mci_send_string(f"set {alias} time format msf")
+        start_msf = format_tmsf(start_frame)
+        # Stop one frame before the next track to avoid bleeding into it.
+        end_msf = format_tmsf(max(start_frame, end_frame - 1))
+        mci_send_string(f"play {alias} from {start_msf} to {end_msf}")
+    except Exception:
+        try:
+            mci_send_string(f"close {alias}")
+        except RuntimeError:
+            pass
+        raise
+    return alias
+
+
+def stop_cd_playback(drive_letter):
+    """Stop any MCI playback started by start_cd_playback and release the alias."""
+    if not drive_letter:
+        return
+    alias = _play_alias(drive_letter)
+    try:
+        mci_send_string(f"stop {alias}")
+    except RuntimeError:
+        pass
+    try:
+        mci_send_string(f"close {alias}")
+    except RuntimeError:
+        pass
+
+
+def get_cd_playback_mode(drive_letter):
+    alias = _play_alias(drive_letter)
+    try:
+        return mci_send_string(f"status {alias} mode").lower()
+    except RuntimeError:
+        return ""
 
 
 def get_cd_toc(drive_letter, alias="cd"):
@@ -689,29 +744,41 @@ def show_lyrics_window(track_title, lyrics):
 # pyrefly: ignore [invalid-syntax]
 def play_cd_track_async(drive_letter, start_frame, end_frame, track_title, window, state=None):
     """
-    Rip a track to a temporary WAV and play it in a background thread.
-    Updates the window log with playback status.
+    Play a CD track directly from the drive via MCI.
+    Playback starts immediately (no ripping to a temp WAV) and stops responsively.
+    Polls until the track ends or state["stop_playback"] is set.
     """
     try:
-        temp_wav = os.path.join(os.environ.get('TEMP', 'C:\\Temp'), f"AudioArchivist_play_{int(os.times()[4]*1000)}.wav")
-        append_log(window, f"Playing: {track_title}...")
-        rip_audio_track(drive_letter, start_frame, end_frame, temp_wav)
-        
-        # Fetch and store lyrics if state is provided
+        append_log(window, f"Playing: {track_title}")
+        start_cd_playback(drive_letter, start_frame, end_frame)
+
+        # Fetch lyrics after playback is underway so the UI is never blocked
+        # waiting on a network round-trip before audio starts.
         if state is not None:
-            lyrics = fetch_lyrics("", track_title)  # We'll get artist from metadata
-            state["current_lyrics"] = lyrics
-        
-        # Play the WAV file
-        winsound.PlaySound(temp_wav, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
-        append_log(window, f"Playback finished: {track_title}")
-        
-        # Clean up temp file
-        try:
-            os.remove(temp_wav)
-        except:
-            pass
+            try:
+                metadata = state.get("metadata") or {}
+                artist = metadata.get("artist", "") if isinstance(metadata, dict) else ""
+                state["current_lyrics"] = fetch_lyrics(artist, track_title)
+            except Exception:
+                state["current_lyrics"] = ""
+
+        # Poll until playback completes or stop is requested.
+        while True:
+            if state is not None and state.get("stop_playback"):
+                break
+            mode = get_cd_playback_mode(drive_letter)
+            if mode and mode != "playing":
+                break
+            time.sleep(0.1)
+
+        stop_cd_playback(drive_letter)
+        if state is None or not state.get("stop_playback"):
+            append_log(window, f"Playback finished: {track_title}")
     except Exception as exc:
+        try:
+            stop_cd_playback(drive_letter)
+        except Exception:
+            pass
         append_log(window, f"Playback error: {exc}")
 
 def search_by_text(window, artist, album):
@@ -1327,14 +1394,16 @@ def main():
             
             track_info = metadata["tracks"][track_index] if metadata and track_index < len(metadata.get("tracks", [])) else {"number": track_index + 1, "title": f"Track {track_index + 1}"}
             track_title = track_info.get("title", f"Track {track_index + 1}")
-            
-            # Fetch lyrics before playing
-            artist = metadata.get("artist", "") if metadata else ""
-            lyrics = fetch_lyrics(artist, track_title)
-            state["current_lyrics"] = lyrics
-            
+
             window["-PLAYBACK-STATUS-"].update(f"Playing: {track_title}")
+            # Tear down any prior playback so the new track starts cleanly.
+            stop_cd_playback(drive)
+            previous_thread = state.get("playback_thread")
+            state["stop_playback"] = True
+            if previous_thread is not None and previous_thread.is_alive():
+                previous_thread.join(timeout=0.5)
             state["stop_playback"] = False
+            state["current_lyrics"] = ""  # populated asynchronously by the playback thread
             thread = threading.Thread(target=play_cd_track_async, args=(drive, start, end, track_title, window, state), daemon=True)
             state["playback_thread"] = thread
             thread.start()
@@ -1364,13 +1433,9 @@ def main():
                         
                         track_info = metadata["tracks"][track_index] if metadata and track_index < len(metadata.get("tracks", [])) else {"number": track_index + 1, "title": f"Track {track_index + 1}"}
                         track_title = track_info.get("title", f"Track {track_index + 1}")
-                        
-                        # Fetch lyrics for this track
-                        artist = metadata.get("artist", "") if metadata else ""
-                        lyrics = fetch_lyrics(artist, track_title)
-                        state["current_lyrics"] = lyrics
-                        
+
                         window["-PLAYBACK-STATUS-"].update(f"Playing: {track_title} ({track_index + 1}/{len(track_positions) - 1})")
+                        # Lyrics are fetched inside play_cd_track_async so playback starts immediately.
                         play_cd_track_async(drive, start, end, track_title, window, state)
                     
                     window["-PLAYBACK-STATUS-"].update("Playback complete.")
@@ -1385,8 +1450,19 @@ def main():
 
         if event == "-STOP-PLAY-":
             state["stop_playback"] = True
-            window["-PLAYBACK-STATUS-"].update("Stopping...")
-            append_log(window, "Playback stop requested.")
+            drive = state.get("selected_drive")
+            # Stop MCI playback immediately so the user hears silence within ~10ms.
+            try:
+                stop_cd_playback(drive)
+            except Exception:
+                pass
+            # Defensive: also halt any legacy winsound playback if it were ever started.
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
+            window["-PLAYBACK-STATUS-"].update("Stopped")
+            append_log(window, "Playback stopped.")
 
         if event == "-EJECT-DRIVE-":
             drive = state.get("selected_drive")
