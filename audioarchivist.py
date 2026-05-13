@@ -686,7 +686,8 @@ def show_lyrics_window(track_title, lyrics):
     window.close()
 
 
-def play_cd_track_async(drive_letter, start_frame, end_frame, track_title, window, state=None, state=None):
+# pyrefly: ignore [invalid-syntax]
+def play_cd_track_async(drive_letter, start_frame, end_frame, track_title, window, state=None):
     """
     Rip a track to a temporary WAV and play it in a background thread.
     Updates the window log with playback status.
@@ -713,11 +714,8 @@ def play_cd_track_async(drive_letter, start_frame, end_frame, track_title, windo
     except Exception as exc:
         append_log(window, f"Playback error: {exc}")
 
-
-def play_cd_track_async_old(drive_letter, start_frame, end_frame, track_title, window):
-
-
 def search_by_text(window, artist, album):
+    
     try:
         release = search_musicbrainz_release(artist, album)
         if release and "id" in release:
