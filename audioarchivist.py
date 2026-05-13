@@ -11,7 +11,9 @@ import webbrowser
 import subprocess
 import io
 import winsound
-from urllib.request import urlopen
+from html import unescape as html_unescape
+from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
 from ctypes import WinDLL, create_unicode_buffer, windll
 from ctypes import c_ulong, c_ushort, c_ubyte, Structure, sizeof
 from ctypes import wintypes
@@ -816,37 +818,133 @@ def create_file_metadata(path, metadata, track_number, track_title, audio_format
         pass
 
 
+GENIUS_API_BASE = "https://api.genius.com"
+# Genius's HTML pages reject obviously-bot user agents, so pretend to be a recent Chrome.
+GENIUS_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+GENIUS_PAGE_HEADERS = {
+    "User-Agent": GENIUS_USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def _genius_search(artist, track_title, token):
+    query = quote_plus(f"{artist} {track_title}".strip())
+    req = Request(
+        f"{GENIUS_API_BASE}/search?q={query}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "User-Agent": GENIUS_USER_AGENT,
+            "Accept": "application/json",
+        },
+    )
+    with urlopen(req, timeout=10) as response:
+        return json.loads(response.read().decode("utf-8", errors="ignore"))
+
+
+def _pick_genius_hit(hits, artist):
+    """Return the best matching hit's result dict, or None."""
+    if not hits:
+        return None
+    artist_lc = (artist or "").lower()
+    if artist_lc:
+        for hit in hits:
+            result = hit.get("result") or {}
+            primary = (result.get("primary_artist") or {}).get("name", "").lower()
+            if primary and (artist_lc in primary or primary in artist_lc):
+                return result
+    return (hits[0] or {}).get("result")
+
+
+def _extract_div_blocks(html, opening_re):
+    """Return the inner HTML of each <div> whose opening tag matches opening_re,
+    correctly accounting for nested <div> elements."""
+    tag_re = re.compile(r"<(/?)div\b[^>]*>", re.IGNORECASE)
+    blocks = []
+    for opener in opening_re.finditer(html):
+        start = opener.end()
+        depth = 1
+        end = None
+        for tag in tag_re.finditer(html, pos=start):
+            if tag.group(1):
+                depth -= 1
+            else:
+                depth += 1
+            if depth == 0:
+                end = tag.start()
+                break
+        if end is not None:
+            blocks.append(html[start:end])
+    return blocks
+
+
+def _html_to_lyrics_text(fragment):
+    text = re.sub(r"<br\s*/?>", "\n", fragment, flags=re.IGNORECASE)
+    text = re.sub(r"</p\s*>", "\n\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html_unescape(text)
+    # Collapse runs of blank lines and strip trailing whitespace per line.
+    lines = [line.rstrip() for line in text.splitlines()]
+    cleaned = []
+    blank = False
+    for line in lines:
+        if not line.strip():
+            if not blank and cleaned:
+                cleaned.append("")
+            blank = True
+        else:
+            cleaned.append(line)
+            blank = False
+    return "\n".join(cleaned).strip()
+
+
+def _scrape_genius_lyrics(page_url):
+    req = Request(page_url, headers=GENIUS_PAGE_HEADERS)
+    with urlopen(req, timeout=10) as response:
+        html = response.read().decode("utf-8", errors="ignore")
+
+    # Modern Genius layout: one or more <div data-lyrics-container="true" ...>...</div>.
+    modern_re = re.compile(r'<div[^>]*data-lyrics-container="true"[^>]*>', re.IGNORECASE)
+    blocks = _extract_div_blocks(html, modern_re)
+    if not blocks:
+        # Legacy layout fallback.
+        legacy_re = re.compile(r'<div[^>]*class="lyrics"[^>]*>', re.IGNORECASE)
+        blocks = _extract_div_blocks(html, legacy_re)
+    if not blocks:
+        return ""
+    return _html_to_lyrics_text("\n".join(blocks))
+
+
 def fetch_lyrics(artist, track_title):
     """
-    Fetch lyrics from ChartLyrics API.
-    Returns lyrics string or empty string if not found.
+    Look up a song on Genius using GENIUS_ACCESS_TOKEN and scrape lyrics from
+    the resulting song page. Returns an empty string on any failure so callers
+    can fall back gracefully.
     """
-    if not artist or not track_title:
+    if not track_title:
         return ""
-    
+    token = os.environ.get("GENIUS_ACCESS_TOKEN", "").strip()
+    if not token:
+        return ""
     try:
-        # Sanitize inputs
-        artist_clean = re.sub(r'[^\w\s]', '', artist).strip()
-        track_clean = re.sub(r'[^\w\s]', '', track_title).strip()
-        
-        if not artist_clean or not track_clean:
-            return ""
-        
-        # Try ChartLyrics API
-        url = f"http://api.chartlyrics.com/apiv1.asmx/SearchLyricsDirect?artist={artist_clean}&song={track_clean}"
-        with urlopen(url, timeout=5) as response:
-            content = response.read().decode('utf-8', errors='ignore')
-            
-            # Extract lyrics from XML response
-            match = re.search(r'<Lyric>(.*?)</Lyric>', content, re.DOTALL)
-            if match:
-                lyrics = match.group(1).strip()
-                if lyrics and lyrics.lower() not in ('not found', ''):
-                    return lyrics
+        data = _genius_search(artist or "", track_title, token)
     except Exception:
-        pass
-    
-    return ""
+        return ""
+    hits = (data.get("response") or {}).get("hits", []) if isinstance(data, dict) else []
+    result = _pick_genius_hit(hits, artist)
+    if not result:
+        return ""
+    page_url = result.get("url", "")
+    if not page_url:
+        return ""
+    try:
+        return _scrape_genius_lyrics(page_url)
+    except Exception:
+        return ""
 
 def convert_to_compressed(input_wav, output_file, metadata, track_info, audio_format, cover_path=None):
     ffmpeg_exe = r"C:\Tools\ffmpeg\bin\ffmpeg.exe"
