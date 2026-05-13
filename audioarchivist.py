@@ -3,6 +3,7 @@ import os
 import platform
 import re
 import threading
+import time
 import traceback
 import wave
 import json
@@ -38,6 +39,30 @@ except Exception as e:
     WAVE = None
     # This helps diagnose why mutagen might not be loading even if installed
     print(f"Warning: Could not import mutagen.wave (required for WAV tagging): {e}")
+
+try:
+    import mutagen
+    from mutagen.id3 import TIT2, TPE1, TALB, TDRC, TCON, TRCK, TPUB, COMM
+    from mutagen.easyid3 import EasyID3
+
+    def _easy_comment_get(id3, _key):
+        return [str(f.text[0]) for f in id3.getall("COMM") if f.text]
+
+    def _easy_comment_set(id3, _key, value):
+        id3.delall("COMM")
+        if isinstance(value, str):
+            value = [value]
+        for item in value:
+            id3.add(COMM(encoding=3, lang="eng", desc="", text=[item]))
+
+    def _easy_comment_del(id3, _key):
+        id3.delall("COMM")
+
+    EasyID3.RegisterKey("comment", _easy_comment_get, _easy_comment_set, _easy_comment_del)
+except Exception as e:
+    mutagen = None
+    TIT2 = TPE1 = TALB = TDRC = TCON = TRCK = TPUB = COMM = None
+    print(f"Warning: Could not import mutagen (required for file tag editing): {e}")
 
 
 MUSICBRAINZ_AGENT_NAME = "AudioArchivist"
@@ -256,6 +281,190 @@ def eject_cd_drive(drive_letter):
         return True
     except Exception as exc:
         return False
+
+
+SUPPORTED_AUDIO_EXTS = (".mp3", ".flac", ".wav", ".ogg", ".m4a", ".aac", ".wma")
+
+# Mapping between our internal tag names and ID3 frame ids (used for WAV's
+# embedded ID3 chunk).
+_WAV_ID3_MAP = (
+    ("title",  "TIT2", "TIT2"),
+    ("artist", "TPE1", "TPE1"),
+    ("album",  "TALB", "TALB"),
+    ("date",   "TDRC", "TDRC"),
+    ("genre",  "TCON", "TCON"),
+    ("track",  "TRCK", "TRCK"),
+    ("label",  "TPUB", "TPUB"),
+)
+
+# Mapping between our internal tag names and mutagen "easy" keys for everything else.
+_GENERIC_TAG_MAP = {
+    "title":   "title",
+    "artist":  "artist",
+    "album":   "album",
+    "date":    "date",
+    "genre":   "genre",
+    "track":   "tracknumber",
+    "label":   "organization",
+    "comment": "comment",
+}
+
+_EMPTY_TAGS = {key: "" for key in _GENERIC_TAG_MAP.keys()}
+
+
+def _wav_id3_frame_class(frame_id):
+    return {"TIT2": TIT2, "TPE1": TPE1, "TALB": TALB, "TDRC": TDRC,
+            "TCON": TCON, "TRCK": TRCK, "TPUB": TPUB}[frame_id]
+
+
+def _read_wav_tags(path):
+    if WAVE is None:
+        raise RuntimeError("mutagen.wave is not available; cannot read WAV tags.")
+    audio = WAVE(path)
+    out = dict(_EMPTY_TAGS)
+    if audio.tags:
+        for tag_key, frame_id, _ in _WAV_ID3_MAP:
+            frame = audio.tags.get(frame_id)
+            if frame is not None and getattr(frame, "text", None):
+                out[tag_key] = str(frame.text[0])
+        for frame in audio.tags.getall("COMM"):
+            if frame.text:
+                out["comment"] = str(frame.text[0])
+                break
+    return out
+
+
+def _write_wav_tags(path, tags):
+    if WAVE is None or COMM is None:
+        raise RuntimeError("mutagen.wave is not available; cannot write WAV tags.")
+    audio = WAVE(path)
+    if audio.tags is None:
+        audio.add_tags()
+    for _, frame_id, _ in _WAV_ID3_MAP:
+        audio.tags.delall(frame_id)
+    audio.tags.delall("COMM")
+    for tag_key, frame_id, _ in _WAV_ID3_MAP:
+        value = str(tags.get(tag_key, "")).strip()
+        if value:
+            audio.tags.add(_wav_id3_frame_class(frame_id)(encoding=3, text=[value]))
+    comment = str(tags.get("comment", "")).strip()
+    if comment:
+        audio.tags.add(COMM(encoding=3, lang="eng", desc="", text=[comment]))
+    audio.save()
+
+
+def _first_str(value):
+    if not value:
+        return ""
+    if isinstance(value, list):
+        return str(value[0]) if value else ""
+    return str(value)
+
+
+def _read_generic_tags(path):
+    if mutagen is None:
+        raise RuntimeError("mutagen is not available; cannot read tags.")
+    audio = mutagen.File(path, easy=True)
+    if audio is None:
+        raise RuntimeError(f"Unsupported audio file format: {path}")
+    out = dict(_EMPTY_TAGS)
+    for our_key, mut_key in _GENERIC_TAG_MAP.items():
+        out[our_key] = _first_str(audio.get(mut_key))
+    return out
+
+
+def _write_generic_tags(path, tags):
+    if mutagen is None:
+        raise RuntimeError("mutagen is not available; cannot write tags.")
+    audio = mutagen.File(path, easy=True)
+    if audio is None:
+        raise RuntimeError(f"Unsupported audio file format: {path}")
+    if audio.tags is None:
+        audio.add_tags()
+    skipped = []
+    for our_key, mut_key in _GENERIC_TAG_MAP.items():
+        value = str(tags.get(our_key, ""))
+        try:
+            if value:
+                audio[mut_key] = value
+            elif mut_key in audio:
+                del audio[mut_key]
+        except (KeyError, ValueError) as exc:
+            # Some formats (e.g. EasyMP4) don't recognise every key in our schema.
+            # Skip those rather than aborting the whole save.
+            skipped.append((our_key, str(exc)))
+    audio.save()
+    return skipped
+
+
+def read_audio_tags(path):
+    if os.path.splitext(path)[1].lower() == ".wav":
+        return _read_wav_tags(path)
+    return _read_generic_tags(path)
+
+
+def write_audio_tags(path, tags):
+    """Write the supplied tag dict to path. Returns a list of (key, reason)
+    tuples for fields the underlying format didn't accept (e.g. M4A has no
+    publisher atom). An empty list means everything saved cleanly."""
+    if os.path.splitext(path)[1].lower() == ".wav":
+        _write_wav_tags(path, tags)
+        return []
+    return _write_generic_tags(path, tags) or []
+
+
+def list_audio_files_in_folder(folder, recursive=True):
+    found = []
+    if recursive:
+        for root, _dirs, names in os.walk(folder):
+            for name in names:
+                if name.lower().endswith(SUPPORTED_AUDIO_EXTS):
+                    found.append(os.path.join(root, name))
+    else:
+        for name in os.listdir(folder):
+            full = os.path.join(folder, name)
+            if os.path.isfile(full) and name.lower().endswith(SUPPORTED_AUDIO_EXTS):
+                found.append(full)
+    found.sort()
+    return found
+
+
+FILE_PLAY_ALIAS = "audio_file_play"
+
+
+def start_file_playback(path):
+    """Open and start playing an audio file via MCI (works for MP3/WAV/WMA via DirectShow)."""
+    try:
+        mci_send_string(f"close {FILE_PLAY_ALIAS}")
+    except RuntimeError:
+        pass
+    mci_send_string(f'open "{path}" alias {FILE_PLAY_ALIAS}')
+    try:
+        mci_send_string(f"play {FILE_PLAY_ALIAS}")
+    except Exception:
+        try:
+            mci_send_string(f"close {FILE_PLAY_ALIAS}")
+        except RuntimeError:
+            pass
+        raise
+
+
+def stop_file_playback():
+    try:
+        mci_send_string(f"stop {FILE_PLAY_ALIAS}")
+    except RuntimeError:
+        pass
+    try:
+        mci_send_string(f"close {FILE_PLAY_ALIAS}")
+    except RuntimeError:
+        pass
+
+
+def get_file_playback_mode():
+    try:
+        return mci_send_string(f"status {FILE_PLAY_ALIAS} mode").lower()
+    except RuntimeError:
+        return ""
 
 
 def get_cd_toc(drive_letter, alias="cd"):
@@ -994,7 +1203,7 @@ def create_main_window(settings):
         default_drive = drives[0]
 
     menu_def = [
-        ['File', ['Exit']],
+        ['File', ['Tag Editor...', '---', 'Exit']],
         ['Edit', ['Options']],
         ['Help', ['About']]
     ]
@@ -1058,6 +1267,240 @@ def create_main_window(settings):
     return sg.Window("Audio Archivist", layout, finalize=True)
 
 
+TAG_FIELD_KEYS = (
+    ("title",   "-TE-TITLE-"),
+    ("artist",  "-TE-ARTIST-"),
+    ("album",   "-TE-ALBUM-"),
+    ("date",    "-TE-DATE-"),
+    ("track",   "-TE-TRACK-"),
+    ("genre",   "-TE-GENRE-"),
+    ("label",   "-TE-LABEL-"),
+    ("comment", "-TE-COMMENT-"),
+)
+
+
+def open_tag_editor():
+    """
+    Show a window for loading audio files / folders, editing tags, and
+    playing files back via MCI. Runs its own event loop and returns when
+    the window is closed.
+    """
+    if sg is None:
+        return
+    if mutagen is None and WAVE is None:
+        sg.popup("mutagen is not installed; cannot read or write audio tags.")
+        return
+
+    file_list = []
+    selected_index = -1
+    play_thread = None
+    play_stop = {"flag": False}
+
+    files_section = [
+        [sg.Text("Files", font=("Any", 10, "bold"))],
+        [sg.Button("Open Files...",  key="-TE-OPEN-FILES-"),
+         sg.Button("Open Folder...", key="-TE-OPEN-FOLDER-")],
+        [sg.Listbox(values=[], size=(45, 22), key="-TE-FILE-LIST-",
+                    enable_events=True,
+                    select_mode=sg.LISTBOX_SELECT_MODE_SINGLE)],
+        [sg.Text("0 file(s) loaded", key="-TE-FILE-COUNT-", size=(40, 1))],
+    ]
+
+    tags_section = [
+        [sg.Text("Tags (Editable)", font=("Any", 10, "bold"))],
+        [sg.Text("Title:",   size=(8, 1)), sg.InputText("", key="-TE-TITLE-",   size=(40, 1))],
+        [sg.Text("Artist:",  size=(8, 1)), sg.InputText("", key="-TE-ARTIST-",  size=(40, 1))],
+        [sg.Text("Album:",   size=(8, 1)), sg.InputText("", key="-TE-ALBUM-",   size=(40, 1))],
+        [sg.Text("Date:",    size=(8, 1)), sg.InputText("", key="-TE-DATE-",    size=(15, 1)),
+         sg.Text("Track:",   size=(6, 1)), sg.InputText("", key="-TE-TRACK-",   size=(8, 1))],
+        [sg.Text("Genre:",   size=(8, 1)), sg.InputText("", key="-TE-GENRE-",   size=(40, 1))],
+        [sg.Text("Label:",   size=(8, 1)), sg.InputText("", key="-TE-LABEL-",   size=(40, 1))],
+        [sg.Text("Comment:", size=(8, 1)), sg.InputText("", key="-TE-COMMENT-", size=(40, 1))],
+        [sg.Button("Save",     key="-TE-SAVE-",     size=(10, 1)),
+         sg.Button("Save All", key="-TE-SAVE-ALL-", size=(10, 1)),
+         sg.Button("Play",     key="-TE-PLAY-",     size=(10, 1)),
+         sg.Button("Stop",     key="-TE-STOP-",     size=(10, 1))],
+        [sg.Text("Status:"), sg.Text("", key="-TE-STATUS-", size=(50, 1))],
+    ]
+
+    layout = [
+        [sg.Column(files_section, vertical_alignment="top"),
+         sg.VSeparator(),
+         sg.Column(tags_section, vertical_alignment="top")],
+    ]
+
+    window = sg.Window("Audio Tag Editor", layout, finalize=True, resizable=True)
+
+    def set_status(message):
+        window["-TE-STATUS-"].update(message)
+
+    def populate_fields(tags):
+        for key, element_key in TAG_FIELD_KEYS:
+            window[element_key].update(tags.get(key, ""))
+
+    def clear_fields():
+        for _, element_key in TAG_FIELD_KEYS:
+            window[element_key].update("")
+
+    def current_fields():
+        return {key: window[element_key].get() for key, element_key in TAG_FIELD_KEYS}
+
+    def update_file_list_view():
+        # Show file names in the listbox; track full paths separately to handle
+        # duplicate names across different folders without losing the mapping.
+        display = []
+        for index, path in enumerate(file_list):
+            display.append(f"{index + 1:>3}. {os.path.basename(path)}")
+        window["-TE-FILE-LIST-"].update(values=display)
+        window["-TE-FILE-COUNT-"].update(f"{len(file_list)} file(s) loaded")
+
+    def play_worker(path):
+        try:
+            set_status(f"Playing: {os.path.basename(path)}")
+            start_file_playback(path)
+            while True:
+                if play_stop["flag"]:
+                    break
+                mode = get_file_playback_mode()
+                if mode and mode != "playing":
+                    break
+                time.sleep(0.1)
+            stop_file_playback()
+            if not play_stop["flag"]:
+                set_status(f"Finished: {os.path.basename(path)}")
+        except Exception as exc:
+            try:
+                stop_file_playback()
+            except Exception:
+                pass
+            set_status(f"Playback error: {exc}")
+
+    while True:
+        event, values = window.read()
+        if event in (sg.WIN_CLOSED, "Exit"):
+            play_stop["flag"] = True
+            stop_file_playback()
+            break
+
+        if event == "-TE-OPEN-FILES-":
+            picked = sg.popup_get_file(
+                "Select audio files",
+                multiple_files=True,
+                file_types=(("Audio files", "*.mp3 *.flac *.wav *.ogg *.m4a *.aac *.wma"),
+                            ("All files", "*.*")),
+            )
+            if picked:
+                paths = [p.strip() for p in picked.split(";") if p.strip()]
+                file_list = [p for p in paths if p.lower().endswith(SUPPORTED_AUDIO_EXTS)]
+                selected_index = -1
+                clear_fields()
+                update_file_list_view()
+                set_status(f"Loaded {len(file_list)} file(s).")
+
+        elif event == "-TE-OPEN-FOLDER-":
+            folder = sg.popup_get_folder("Select folder of audio files")
+            if folder:
+                try:
+                    file_list = list_audio_files_in_folder(folder, recursive=True)
+                except Exception as exc:
+                    file_list = []
+                    set_status(f"Failed to list folder: {exc}")
+                selected_index = -1
+                clear_fields()
+                update_file_list_view()
+                if file_list:
+                    set_status(f"Loaded {len(file_list)} file(s) from {folder}.")
+                else:
+                    set_status(f"No audio files found under {folder}.")
+
+        elif event == "-TE-FILE-LIST-":
+            picks = values.get("-TE-FILE-LIST-", []) if values else []
+            if not picks:
+                continue
+            label = picks[0]
+            # The display label is "N. <basename>"; recover the index from its prefix.
+            try:
+                selected_index = int(label.split(".", 1)[0].strip()) - 1
+            except (ValueError, IndexError):
+                selected_index = -1
+            if selected_index < 0 or selected_index >= len(file_list):
+                continue
+            path = file_list[selected_index]
+            try:
+                populate_fields(read_audio_tags(path))
+                set_status(f"Loaded tags from {os.path.basename(path)}")
+            except Exception as exc:
+                clear_fields()
+                set_status(f"Failed to read tags: {exc}")
+
+        elif event == "-TE-SAVE-":
+            if selected_index < 0 or selected_index >= len(file_list):
+                set_status("Select a file first.")
+                continue
+            path = file_list[selected_index]
+            try:
+                skipped = write_audio_tags(path, current_fields())
+                base = os.path.basename(path)
+                if skipped:
+                    fields = ", ".join(k for k, _ in skipped)
+                    set_status(f"Saved tags to {base} (skipped unsupported: {fields})")
+                else:
+                    set_status(f"Saved tags to {base}")
+            except Exception as exc:
+                set_status(f"Failed to save tags: {exc}")
+
+        elif event == "-TE-SAVE-ALL-":
+            if not file_list:
+                set_status("No files loaded.")
+                continue
+            fields = current_fields()
+            # Per-file fields (title, track) come from each file's existing tags;
+            # album-level fields are overwritten with what's in the form.
+            bulk_keys = ("artist", "album", "date", "genre", "label", "comment")
+            failures = []
+            for path in file_list:
+                try:
+                    existing = read_audio_tags(path)
+                except Exception:
+                    existing = dict(_EMPTY_TAGS)
+                for key in bulk_keys:
+                    existing[key] = fields[key]
+                try:
+                    write_audio_tags(path, existing)
+                except Exception as exc:
+                    failures.append((os.path.basename(path), str(exc)))
+            if failures:
+                set_status(
+                    f"Bulk-saved {len(file_list) - len(failures)}/{len(file_list)}; "
+                    f"first failure: {failures[0][0]} ({failures[0][1]})"
+                )
+            else:
+                set_status(f"Bulk-saved album fields to {len(file_list)} file(s).")
+
+        elif event == "-TE-PLAY-":
+            if selected_index < 0 or selected_index >= len(file_list):
+                set_status("Select a file first.")
+                continue
+            # Tear down any prior playback before starting a new one.
+            play_stop["flag"] = True
+            if play_thread is not None and play_thread.is_alive():
+                play_thread.join(timeout=0.5)
+            play_stop["flag"] = False
+            path = file_list[selected_index]
+            play_thread = threading.Thread(target=play_worker, args=(path,), daemon=True)
+            play_thread.start()
+
+        elif event == "-TE-STOP-":
+            play_stop["flag"] = True
+            try:
+                stop_file_playback()
+            except Exception:
+                pass
+            set_status("Stopped.")
+
+    window.close()
+
+
 def main():
     try:
         ensure_dependencies()
@@ -1088,6 +1531,10 @@ def main():
                 settings["output_folder"] = values.get("-OUT-", settings.get("output_folder", ""))
             save_settings(settings)
             break
+
+        if event == "Tag Editor...":
+            open_tag_editor()
+            continue
 
         if event == "Options":
             opt_layout = [
