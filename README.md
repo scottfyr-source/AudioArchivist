@@ -1,4 +1,4 @@
-# CDRipper
+# Audio Archivist
 
 A simple Windows CD ripper with a GUI front end and MusicBrainz metadata lookup.
 
@@ -14,7 +14,7 @@ A simple Windows CD ripper with a GUI front end and MusicBrainz metadata lookup.
 - Calculate a MusicBrainz disc ID and query metadata
 - Display album and track metadata in the GUI
 - Rip audio tracks to WAV files
-- Tag WAV files with basic track metadata using Mutagen
+- Tag WAV files with basic track metadata using Mutagen, MusicBrainz, Genius (lyrics)
 
 ## Dependencies
 
@@ -27,7 +27,7 @@ python -m pip install -r requirements.txt
 ## Running the app
 
 ```powershell
-python cd_ripper.py
+ python .\audioarchivist.py
 ```
 
 ## Notes
