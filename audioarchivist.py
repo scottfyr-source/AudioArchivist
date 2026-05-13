@@ -39,6 +39,12 @@ except Exception as e:
     # This helps diagnose why mutagen might not be loading even if installed
     print(f"Warning: Could not import mutagen.wave (required for WAV tagging): {e}")
 
+try:
+    from mutagen.id3 import TIT2, TPE1, TALB, TDRC, TCON, TRCK, TPUB, COMM, USLT
+except Exception as e:
+    TIT2 = TPE1 = TALB = TDRC = TCON = TRCK = TPUB = COMM = USLT = None
+    print(f"Warning: Could not import mutagen.id3 (required for WAV tagging): {e}")
+
 
 MUSICBRAINZ_AGENT_NAME = "AudioArchivist"
 MUSICBRAINZ_AGENT_VERSION = "0.1"
@@ -792,28 +798,51 @@ def update_cover_display(window, source, is_path=False):
         print(f"Failed to load cover art: {e}")
         window["-COVER-"].update(data=None)
 
-def create_file_metadata(path, metadata, track_number, track_title, audio_format, lyrics=""):
+def create_file_metadata(path, metadata, track_number, track_title, audio_format, lyrics="", window=None):
+    """
+    Write rip-time metadata to a freshly-encoded WAV file as an embedded ID3
+    chunk. Earlier versions of this function wrote RIFF-INFO chunk IDs
+    (INAM/IART/...) onto mutagen's ID3 tag object, which mutagen >= 1.46
+    rejects with TypeError; the resulting WAVs ended up with no tags at all.
+    Using real ID3 frames lets Windows Media Player, foobar2000, MusicBee and
+    everything else surface the tags correctly.
+    """
     if WAVE is None or audio_format.upper() != "WAV":
+        return
+    if any(frame_cls is None for frame_cls in (TIT2, TPE1, TALB, TDRC, TCON, TRCK, TPUB, COMM, USLT)):
+        if window is not None:
+            append_log(window, f"Could not tag {os.path.basename(path)}: mutagen.id3 frames unavailable.")
         return
     try:
         audio = WAVE(path)
-        # Initialize tags if the WAV file doesn't have a RIFF INFO block yet
         if audio.tags is None:
             audio.add_tags()
-        
-        audio.tags["INAM"] = str(track_title)
-        audio.tags["IART"] = str(metadata.get("artist", ""))
-        audio.tags["IPRD"] = str(metadata.get("title", ""))
-        audio.tags["ICRD"] = str(metadata.get("date", ""))
-        audio.tags["IGNR"] = str(metadata.get("genre", ""))
-        audio.tags["ITRK"] = str(track_number)
-        audio.tags["IPUB"] = str(metadata.get("label", ""))
-        audio.tags["ICMT"] = str(metadata.get("url", ""))
-        if lyrics:
-            audio.tags["ILYR"] = str(lyrics)
+        # Replace any previous values for the fields we own so re-tagging is clean.
+        for frame_id in ("TIT2", "TPE1", "TALB", "TDRC", "TCON", "TRCK", "TPUB", "COMM", "USLT"):
+            audio.tags.delall(frame_id)
+
+        title  = str(track_title).strip()
+        artist = str(metadata.get("artist", "")).strip()
+        album  = str(metadata.get("title",  "")).strip()
+        date   = str(metadata.get("date",   "")).strip()
+        genre  = str(metadata.get("genre",  "")).strip()
+        label  = str(metadata.get("label",  "")).strip()
+        url    = str(metadata.get("url",    "")).strip()
+        track  = str(track_number).strip()
+
+        if title:  audio.tags.add(TIT2(encoding=3, text=[title]))
+        if artist: audio.tags.add(TPE1(encoding=3, text=[artist]))
+        if album:  audio.tags.add(TALB(encoding=3, text=[album]))
+        if date:   audio.tags.add(TDRC(encoding=3, text=[date]))
+        if genre:  audio.tags.add(TCON(encoding=3, text=[genre]))
+        if track:  audio.tags.add(TRCK(encoding=3, text=[track]))
+        if label:  audio.tags.add(TPUB(encoding=3, text=[label]))
+        if url:    audio.tags.add(COMM(encoding=3, lang="eng", desc="", text=[url]))
+        if lyrics: audio.tags.add(USLT(encoding=3, lang="eng", desc="", text=str(lyrics)))
         audio.save()
-    except Exception:
-        pass
+    except Exception as exc:
+        if window is not None:
+            append_log(window, f"Failed to tag {os.path.basename(path)}: {exc}")
 
 
 def fetch_lyrics(artist, track_title):
@@ -966,7 +995,7 @@ def rip_thread(window, state, output_folder, selected_indices, audio_format, fet
                     append_log(window, f"Lyrics found for {track_info['title']}")
             
             if is_wav:
-                create_file_metadata(rip_path, metadata or {}, int(track_info["number"] or index + 1), track_info["title"], audio_format, lyrics)
+                create_file_metadata(rip_path, metadata or {}, int(track_info["number"] or index + 1), track_info["title"], audio_format, lyrics, window=window)
                 append_log(window, f"Saved {path}")
             else:
                 append_log(window, f"Compressing to {audio_format}...")
