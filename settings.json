@@ -1,0 +1,7 @@
+{
+    "drive": "D",
+    "output_folder": "C:\\Users\\Scott\\Music\\NEW\\Warloghe\\Womb of Pestilence",
+    "root_destination": "C:/Users/Scott/Music/NEW",
+    "subfolder_pattern": "{Artist}\\{Album}",
+    "default_format": "MP3"
+}

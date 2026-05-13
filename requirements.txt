@@ -1,0 +1,5 @@
+PySimpleGUI>=4.81.0
+musicbrainzngs
+mutagen>=1.46
+pywin32>=305
+pillow

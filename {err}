@@ -1,0 +1,5 @@
+open d: type cdaudio alias cd shareable = '1'
+status cd mode = 'open'
+set cd time format tmsf = ''
+status cd numberOfTracks = ''
+close cd = ''
